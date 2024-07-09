@@ -39,13 +39,14 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 from cryptography.hazmat.backends import default_backend
 from lxml import etree
+from threading import Event
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class Drone:
-    def __init__(self, id: str, lat: float, lon: float, speed: int, vspeed: int, alt: int, height: int, pilot_lat: float, pilot_lon: float, description: str, btle_address: Optional[str] = None):
+    def __init__(self, id: str, lat: float, lon: float, speed: int, vspeed: int, alt: int, height: int, pilot_lat: float, pilot_lon: float, description: str):
         self.id = id
         self.lat = lat
         self.lon = lon
@@ -56,7 +57,6 @@ class Drone:
         self.pilot_lat = pilot_lat
         self.pilot_lon = pilot_lon
         self.description = description
-        self.btle_address = btle_address
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,13 +70,12 @@ class Drone:
                 "vertical": self.vspeed
             },
             "altitude": self.alt,
-                "height": self.height,
+            "height": self.height,
             "pilot_location": {
                 "latitude": self.pilot_lat,
                 "longitude": self.pilot_lon
             },
-            "description": self.description,
-            "btle_address": self.btle_address
+            "description": self.description
         }
 
     def to_cot_xml(self) -> str:
@@ -107,11 +106,8 @@ class Drone:
         precisionlocation.set('geopointsrc', 'gps')
         precisionlocation.set('altsrc', 'gps')
 
-        remarks_text = f"Description: {self.description}, Speed: {self.speed}, VSpeed: {self.vspeed}, Altitude: {self.alt}, Height: {self.height}, Pilot Lat: {self.pilot_lat}, Pilot Lon: {self.pilot_lon}, OpenDroneID: {self.id}"
-        if self.btle_address:
-            remarks_text += f", BTLE ID: {self.btle_address.replace(':', '')}"
         remarks = etree.SubElement(detail, 'remarks')
-        remarks.text = remarks_text
+        remarks.text = f"Description: {self.description}, Speed: {self.speed}, VSpeed: {self.vspeed}, Altitude: {self.alt}, Height: {self.height}, Pilot Lat: {self.pilot_lat}, Pilot Lon: {self.pilot_lon}"
 
         color = etree.SubElement(detail, 'color')
         color.set('argb', '-256')
@@ -142,13 +138,6 @@ def get_drone_id(entry: Dict[str, Any]) -> str:
         logger.error(f"Key error in get_drone_id: {e}")
         return "unknown"
 
-def get_btle_address(entry: Dict[str, Any]) -> Optional[str]:
-    try:
-        return entry["_source"]["layers"]["btle"]["btle.advertising_address"]
-    except KeyError as e:
-        logger.error(f"Key error in get_btle_address: {e}")
-        return None
-
 def parse_drone_info(entry: Dict[str, Any]) -> Optional[Drone]:
     try:
         odid = entry["_source"]["layers"]["opendroneid"]
@@ -156,8 +145,6 @@ def parse_drone_info(entry: Dict[str, Any]) -> Optional[Drone]:
         description = odid["opendroneid.message.pack"].get("opendroneid.message.selfid", {}).get("OpenDroneID.self_desc", "")
         location = odid["opendroneid.message.pack"].get("opendroneid.message.location", {})
         operator = odid["opendroneid.message.pack"].get("opendroneid.message.operatorid", {})
-
-        btle_address = get_btle_address(entry)
 
         return Drone(
             id=basicid.get("OpenDroneID.basicID_id_asc", "unknown"),
@@ -169,31 +156,31 @@ def parse_drone_info(entry: Dict[str, Any]) -> Optional[Drone]:
             height=int(location.get("OpenDroneID.loc_height", 0)),
             pilot_lat=float(operator.get("OpenDroneID.system_lat", 0)) / 1e7,
             pilot_lon=float(operator.get("OpenDroneID.system_lon", 0)) / 1e7,
-            description=description,
-            btle_address=btle_address
+            description=description
         )
     except KeyError as e:
         logger.error(f"Error parsing drone info: {e}")
         return None
 
-def process_data(data: str, log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
+def process_data(data: str, log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, stop_event: Event, last_data_received: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
     try:
         if data.strip() == "":
             logger.info("Received empty data, skipping.")
             return
         entry = json.loads(data)
         logger.debug(f"Loaded JSON entry: {entry}")
+        last_data_received.set()  # Reset the timeout timer
         if isinstance(entry, list):
             for item in entry:
-                process_single_entry(item, log_location, output_file, tak_host, tak_port, interval, tls_context, debug)
+                process_single_entry(item, log_location, output_file, tak_host, tak_port, interval, stop_event, tls_context, debug)
         else:
-            process_single_entry(entry, log_location, output_file, tak_host, tak_port, interval, tls_context, debug)
+            process_single_entry(entry, log_location, output_file, tak_host, tak_port, interval, stop_event, tls_context, debug)
     except json.JSONDecodeError as e:
         logger.error(f"Error processing data: Invalid JSON format. {e}")
     except Exception as e:
         logger.error(f"Error processing data: {e}")
 
-def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
+def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, stop_event: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
     try:
         if is_drone_info(entry):
             drone_id = get_drone_id(entry)
@@ -221,7 +208,12 @@ def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file:
 def send_to_tak(cot_xml: str, tak_host: str, tak_port: int, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto(cot_xml.encode(), (tak_host, tak_port))
+        
+        # Ensure cot_xml is bytes
+        if isinstance(cot_xml, str):
+            cot_xml = cot_xml.encode('utf-8')
+        
+        sock.sendto(cot_xml, (tak_host, tak_port))
         sock.close()
 
         if debug:
@@ -230,7 +222,9 @@ def send_to_tak(cot_xml: str, tak_host: str, tak_port: int, tls_context: Optiona
         logger.error(f"Error sending to TAK server: {e}")
 
 def signal_handler(sig, frame):
+    global stop_event
     logger.info('Exiting and cleaning up...')
+    stop_event.set()  # Stop the monitor thread
     sys.exit(0)
 
 def find_complete_json_objects(buffer: str) -> Tuple[list, str]:
@@ -264,6 +258,7 @@ def load_p12_cert(p12_path: str, password: str) -> Tuple[bytes, bytes, Optional[
     return pkey, cert, ca_certs
 
 def main():
+    global stop_event
     parser = argparse.ArgumentParser(description='Drone data processing server.')
     parser.add_argument('--log-location', action='store_true', help='Only log entries with location data')
     parser.add_argument('--output-file', type=str, help='File to store drone data')
@@ -304,13 +299,26 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    stop_event = Event()
+    last_data_received = Event()
+    last_data_received.set()
+
+    def monitor_data_flow():
+        while not stop_event.is_set():
+            if not last_data_received.wait(timeout=10):
+                logger.info("No data received for 10 seconds, stopping CoT messages.")
+                stop_event.set()
+
+    monitor_thread = threading.Thread(target=monitor_data_flow)
+    monitor_thread.start()
+
     if args.input_file:
         logger.info(f"Processing input file: {args.input_file}")
         try:
             with open(args.input_file, 'r') as f:
                 data = f.read()
                 logger.debug(f"Data from file: {data}")
-                process_data(data, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, tls_context, args.debug)
+                process_data(data, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, stop_event, last_data_received, tls_context, args.debug)
         except Exception as e:
             logger.error(f"Error processing input file: {e}")
     else:
@@ -326,7 +334,7 @@ def main():
 
                     with client_socket:
                         buffer = ""
-                        while True:
+                        while not stop_event.is_set():
                             data = client_socket.recv(1024)
                             if not data:
                                 break
@@ -336,9 +344,12 @@ def main():
                             # Find and process complete JSON objects
                             objects, buffer = find_complete_json_objects(buffer)
                             for obj in objects:
-                                process_data(obj, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, tls_context, args.debug)
+                                process_data(obj, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, stop_event, last_data_received, tls_context, args.debug)
         except Exception as e:
             logger.error(f"Error in server setup or connection: {e}")
+
+    stop_event.set()
+    monitor_thread.join()
 
 if __name__ == "__main__":
     main()
