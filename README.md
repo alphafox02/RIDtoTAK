@@ -1,5 +1,17 @@
 # RIDtoTAK
 
+## Licensing
+
+This project is licensed under the MIT License.
+
+### Third-Party Licenses
+
+The following files are licensed under the Apache License 2.0:
+opendroneid-dissector.lua
+
+For more details, see the LICENSE files included in this repository.
+https://github.com/opendroneid/wireshark-dissector
+
 This project processes Remote ID (RID) data from drones and sends it as Cursor on Target (CoT) messages to a TAK server. It integrates with the Sniffle tool to capture Bluetooth packets.
 
 ## Prerequisites
