@@ -34,12 +34,14 @@ import time
 import uuid
 import tempfile
 import logging
+import subprocess
+import os
 from typing import Dict, Tuple, Optional, Any
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 from cryptography.hazmat.backends import default_backend
 from lxml import etree
-from threading import Event
+from threading import Event, Lock
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -162,7 +164,22 @@ def parse_drone_info(entry: Dict[str, Any]) -> Optional[Drone]:
         logger.error(f"Error parsing drone info: {e}")
         return None
 
-def process_data(data: str, log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, stop_event: Event, last_data_received: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
+class LatestDataQueue:
+    def __init__(self):
+        self.lock = Lock()
+        self.data = None
+
+    def update_data(self, new_data):
+        with self.lock:
+            self.data = new_data
+
+    def get_data(self):
+        with self.lock:
+            return self.data
+
+latest_data_queue = LatestDataQueue()
+
+def process_data(data: str, log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, stop_event: Event, last_data_received: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
     try:
         if data.strip() == "":
             logger.info("Received empty data, skipping.")
@@ -172,15 +189,15 @@ def process_data(data: str, log_location: bool, output_file: Optional[str], tak_
         last_data_received.set()  # Reset the timeout timer
         if isinstance(entry, list):
             for item in entry:
-                process_single_entry(item, log_location, output_file, tak_host, tak_port, interval, stop_event, tls_context, debug)
+                process_single_entry(item, log_location, output_file, tak_host, tak_port, stop_event, tls_context, debug)
         else:
-            process_single_entry(entry, log_location, output_file, tak_host, tak_port, interval, stop_event, tls_context, debug)
+            process_single_entry(entry, log_location, output_file, tak_host, tak_port, stop_event, tls_context, debug)
     except json.JSONDecodeError as e:
         logger.error(f"Error processing data: Invalid JSON format. {e}")
     except Exception as e:
         logger.error(f"Error processing data: {e}")
 
-def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, interval: int, stop_event: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
+def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file: Optional[str], tak_host: str, tak_port: int, stop_event: Event, tls_context: Optional[ssl.SSLContext] = None, debug: bool = False):
     try:
         if is_drone_info(entry):
             drone_id = get_drone_id(entry)
@@ -189,15 +206,11 @@ def process_single_entry(entry: Dict[str, Any], log_location: bool, output_file:
                 if log_location and (drone.lat == 0 and drone.lon == 0):
                     logger.info("Skipping entry without location data.")
                     return
-                drone_data = drone.to_dict()
-                cot_xml = drone.to_cot_xml()
-                if debug:
-                    logger.debug(f"CoT XML: {cot_xml}")
+                latest_data_queue.update_data(drone)  # Update latest data
                 if output_file:
+                    drone_data = drone.to_dict()
                     with open(output_file, 'a') as f:
                         f.write(json.dumps(drone_data) + '\n')
-                send_to_tak(cot_xml, tak_host, tak_port, tls_context, debug)
-                time.sleep(interval)
             else:
                 logger.info("Drone parsing returned None.")
         else:
@@ -262,8 +275,7 @@ def main():
     parser = argparse.ArgumentParser(description='Drone data processing server.')
     parser.add_argument('--log-location', action='store_true', help='Only log entries with location data')
     parser.add_argument('--output-file', type=str, help='File to store drone data')
-    parser.add_argument('--input-port', type=int, default=12345, help='Port to accept JSON data streams (default: 12345)')
-    parser.add_argument('--input-file', type=str, help='File containing JSON formatted payload of drone data')
+    parser.add_argument('--fifo-pcap-path', type=str, required=True, help='Path to the FIFO pcap file')
     parser.add_argument('--tak-host', type=str, required=True, help='TAK server hostname or IP address')
     parser.add_argument('--tak-port', type=int, required=True, help='TAK server port')
     parser.add_argument('--update-interval', type=int, default=5, help='Update interval in seconds for CoT messages (default: 5)')
@@ -275,11 +287,10 @@ def main():
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
-    HOST = '0.0.0.0'
-    INPUT_PORT = args.input_port
     TAK_HOST = args.tak_host
     TAK_PORT = args.tak_port
     INTERVAL = args.update_interval
+    FIFO_PCAP_PATH = args.fifo_pcap_path
 
     tls_context = None
     if args.tls_p12 and args.tls_password:
@@ -303,53 +314,61 @@ def main():
     last_data_received = Event()
     last_data_received.set()
 
-    def monitor_data_flow():
+    def monitor_fifo_pcap():
+        last_size = 0
         while not stop_event.is_set():
-            if not last_data_received.wait(timeout=10):
-                logger.info("No data received for 10 seconds, stopping CoT messages.")
-                stop_event.set()
+            try:
+                current_size = os.path.getsize(FIFO_PCAP_PATH)
+                if current_size > last_size:
+                    last_data_received.set()
+                last_size = current_size
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error monitoring FIFO pcap file: {e}")
 
-    monitor_thread = threading.Thread(target=monitor_data_flow)
-    monitor_thread.start()
+    fifo_monitor_thread = threading.Thread(target=monitor_fifo_pcap)
+    fifo_monitor_thread.start()
 
-    if args.input_file:
-        logger.info(f"Processing input file: {args.input_file}")
-        try:
-            with open(args.input_file, 'r') as f:
-                data = f.read()
-                logger.debug(f"Data from file: {data}")
-                process_data(data, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, stop_event, last_data_received, tls_context, args.debug)
-        except Exception as e:
-            logger.error(f"Error processing input file: {e}")
-    else:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-                server_socket.bind((HOST, INPUT_PORT))
-                server_socket.listen()
-                logger.info(f"Listening for JSON data on {HOST}:{INPUT_PORT}")
+    def update_cot_messages():
+        while not stop_event.is_set():
+            latest_data = latest_data_queue.get_data()
+            if latest_data:
+                cot_xml = latest_data.to_cot_xml()
+                send_to_tak(cot_xml, TAK_HOST, TAK_PORT, tls_context, args.debug)
+            time.sleep(INTERVAL)
 
-                while True:
-                    client_socket, client_address = server_socket.accept()
-                    logger.info(f"Connected to data source at {client_address}")
+    cot_update_thread = threading.Thread(target=update_cot_messages)
+    cot_update_thread.start()
 
-                    with client_socket:
-                        buffer = ""
-                        while not stop_event.is_set():
-                            data = client_socket.recv(1024)
-                            if not data:
-                                break
+    # Run tshark command
+    try:
+        tshark_command = f"tshark -r {FIFO_PCAP_PATH} -X lua_script:opendroneid-dissector.lua -T json"
+        logger.info(f"Running tshark command: {tshark_command}")
+        tshark_process = subprocess.Popen(tshark_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        buffer = ""
+        while not stop_event.is_set():
+            data = tshark_process.stdout.read(1024)
+            if not data:
+                time.sleep(1)
+                continue
 
-                            buffer += data.decode('utf-8')
-                            
-                            # Find and process complete JSON objects
-                            objects, buffer = find_complete_json_objects(buffer)
-                            for obj in objects:
-                                process_data(obj, args.log_location, args.output_file, TAK_HOST, TAK_PORT, INTERVAL, stop_event, last_data_received, tls_context, args.debug)
-        except Exception as e:
-            logger.error(f"Error in server setup or connection: {e}")
+            buffer += data.decode('utf-8')
+            
+            # Find and process complete JSON objects
+            objects, buffer = find_complete_json_objects(buffer)
+            for obj in objects:
+                process_data(obj, args.log_location, args.output_file, TAK_HOST, TAK_PORT, stop_event, last_data_received, tls_context, args.debug)
+
+        tshark_process.stdout.close()
+        tshark_process.stderr.close()
+        tshark_process.terminate()
+        tshark_process.wait()
+    except Exception as e:
+        logger.error(f"Error running tshark: {e}")
 
     stop_event.set()
-    monitor_thread.join()
+    fifo_monitor_thread.join()
+    cot_update_thread.join()
 
 if __name__ == "__main__":
     main()
