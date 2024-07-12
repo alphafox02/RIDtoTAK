@@ -12,23 +12,28 @@ This project processes Remote ID (RID) data from drones and sends it as Cursor o
 ## Setup Instructions
 
 ### Step 1: Clone the RIDtoTAK Repository
+```bash
 git clone https://github.com/yourusername/RIDtoTAK.git
 cd RIDtoTAK
+```
 
 
 ### Step 2: Set Up FIFO for Drone PCAP
 
 In a separate terminal window, create a FIFO for the drone PCAP:
+```bash
 mkfifo /tmp/drone_pcap
+```
 
 
 ### Step 3: Clone and Set Up Sniffle
 
 In another terminal window, clone the Sniffle repository and run the `sniff_receiver` tool:
+```bash
 git clone https://github.com/nccgroup/Sniffle.git
 cd Sniffle/python_cli
 ./sniff_receiver -l -e -o /tmp/drone_pcap
-
+```
 
 ### Step 4: Run RIDtoTAK
 
@@ -43,4 +48,6 @@ python3 RIDtoTAK.py --tak-host 0.0.0.0 --tak-port 8054 --update-interval 5 --fif
 - `--fifo-pcap-path`: Path to the FIFO PCAP file.
 
 ## Example Command
+```bash
 python3 RIDtoTAK.py --tak-host 192.168.1.100 --tak-port 8087 --update-interval 10 --fifo-pcap-path /tmp/drone_pcap
+```
